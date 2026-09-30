@@ -685,6 +685,42 @@ impl DatanodeConnection {
         handle: &Handle,
     ) -> Result<Self> {
         let url = datanode_url(datanode_id, config);
+        let open = Self::open(
+            url.clone(),
+            datanode_id,
+            token,
+            encryption_key,
+            config,
+            handle,
+        );
+        let Some(timeout) = config.socket_timeout() else {
+            return open.await;
+        };
+
+        let open = {
+            let _runtime = handle.enter();
+            tokio::time::timeout(timeout, open)
+        };
+        match open.await {
+            Ok(result) => result,
+            Err(_) => Err(HdfsError::IOError(std::io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "Timed out connecting to DataNode {url} after {}ms",
+                    timeout.as_millis()
+                ),
+            ))),
+        }
+    }
+
+    async fn open(
+        url: String,
+        datanode_id: &DatanodeIdProto,
+        token: &TokenProto,
+        encryption_key: Option<DataEncryptionKeyProto>,
+        config: &Configuration,
+        handle: &Handle,
+    ) -> Result<Self> {
         let stream = connect(&url, handle).await?;
 
         let sasl_connection = SaslDatanodeConnection::create(stream);
@@ -692,13 +728,22 @@ impl DatanodeConnection {
             .negotiate(datanode_id, token, encryption_key.as_ref(), config)
             .await?;
 
-        let conn = DatanodeConnection {
+        let mut conn = DatanodeConnection {
             client_name: Uuid::new_v4().to_string(),
             reader,
             writer,
-            url: url.to_string(),
+            url,
         };
+        conn.apply_socket_timeout(config, handle);
         Ok(conn)
+    }
+
+    pub(crate) fn apply_socket_timeout(&mut self, config: &Configuration, handle: &Handle) {
+        self.reader.set_idle_timeout(
+            config
+                .socket_timeout()
+                .map(|timeout| (timeout, handle.clone())),
+        );
     }
 
     pub(crate) async fn send(
@@ -773,7 +818,8 @@ impl DatanodeConnection {
         Ok(())
     }
 
-    pub(crate) fn split(self) -> (DatanodeReader, DatanodeWriter) {
+    pub(crate) fn split(mut self) -> (DatanodeReader, DatanodeWriter) {
+        self.reader.set_idle_timeout(None);
         let reader = DatanodeReader {
             reader: self.reader,
         };
@@ -881,8 +927,10 @@ impl DatanodeConnectionCache {
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
+    use std::io::ErrorKind;
     use std::sync::atomic::AtomicI32;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use prost::Message;
     use tokio::sync::mpsc;
@@ -893,9 +941,14 @@ mod test {
     };
 
     use super::{
-        AlignmentContext, CRC32, CRC32C, ReadPacket, RpcConnection, WritePacket, datanode_url,
+        AlignmentContext, CRC32, CRC32C, DatanodeConnection, Op, ReadPacket, RpcConnection,
+        WritePacket, datanode_url,
     };
     use crate::HdfsError;
+    use crate::hdfs::fake_datanode::{
+        encode_packet, fake_datanode, open_read, socket_timeout_config,
+    };
+    use crate::proto::common::TokenProto;
     use bytes::{BufMut, Bytes, BytesMut};
 
     #[test]
@@ -1117,5 +1170,59 @@ mod test {
             .get_data(&info)
             .unwrap_err();
         assert!(matches!(err, HdfsError::ChecksumError));
+    }
+
+    #[tokio::test]
+    async fn stalled_datanode_read_times_out() {
+        let datanode = fake_datanode(vec![], Duration::ZERO).await;
+        let config = socket_timeout_config(200);
+        let mut conn = open_read(&datanode, &config).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), conn.read_packet())
+            .await
+            .expect("stalled read was not timed out");
+
+        assert!(matches!(result, Err(HdfsError::IOError(e)) if e.kind() == ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn stalled_read_times_out_outside_tokio() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let datanode = runtime.block_on(fake_datanode(vec![], Duration::ZERO));
+        let config = socket_timeout_config(200);
+
+        let result = futures::executor::block_on(async {
+            let mut conn = DatanodeConnection::connect(
+                &datanode,
+                &TokenProto::default(),
+                None,
+                &config,
+                runtime.handle(),
+            )
+            .await
+            .unwrap();
+            conn.send(Op::ReadBlock, &hdfs::OpReadBlockProto::default())
+                .await
+                .unwrap();
+            conn.read_packet().await
+        });
+
+        assert!(matches!(result, Err(HdfsError::IOError(e)) if e.kind() == ErrorKind::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn slow_datanode_read_does_not_time_out() {
+        let data = b"slow".to_vec();
+        let bytes = encode_packet(&data, 0)
+            .into_iter()
+            .map(|b| vec![b])
+            .collect();
+        let datanode = fake_datanode(bytes, Duration::from_millis(50)).await;
+        let config = socket_timeout_config(200);
+        let mut conn = open_read(&datanode, &config).await;
+
+        let packet = conn.read_packet().await.unwrap();
+
+        assert_eq!(packet.data, Bytes::from(data));
     }
 }
